@@ -1,0 +1,109 @@
+name: Sync organization card to Hugging Face
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "profile/README.md"
+      - ".github/workflows/sync-huggingface-card.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huggingface-organization-card
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out organization profile source
+        uses: actions/checkout@v4
+
+      - name: Prepare Hugging Face Space card
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _huggingface-card
+          {
+            printf '%s\n' '---'
+            printf '%s\n' 'title: Prysai Lab'
+            printf '%s\n' 'emoji: "🧭"'
+            printf '%s\n' 'colorFrom: red'
+            printf '%s\n' 'colorTo: gray'
+            printf '%s\n' 'sdk: static'
+            printf '%s\n' 'pinned: false'
+            printf '%s\n' '---'
+            printf '\n'
+            cat profile/README.md
+          } > _huggingface-card/README.md
+
+      - name: Require Hugging Face publication configuration
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: test -n "$HF_TOKEN"
+
+      - name: Install the Hugging Face API client
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish the organization card
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet huggingface_hub==1.27.0
+          python - <<'PY'
+          import os
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          from huggingface_hub import CommitOperationAdd, HfApi
+
+          token = os.environ["HF_TOKEN"]
+          repo_id = "Prysai/README"
+          desired = Path("_huggingface-card/README.md").read_bytes()
+          api = HfApi(token=token)
+          api.create_repo(
+              repo_id=repo_id,
+              repo_type="space",
+              space_sdk="static",
+              exist_ok=True,
+          )
+
+          remote = None
+          request = Request(
+              f"https://huggingface.co/spaces/{repo_id}/raw/main/README.md",
+              headers={"Authorization": f"Bearer {token}"},
+          )
+          try:
+              with urlopen(request) as response:
+                  remote = response.read()
+          except HTTPError as error:
+              if error.code != 404:
+                  raise
+
+          if remote == desired:
+              print("Hugging Face organization card is already current.")
+          else:
+              commit = api.create_commit(
+                  repo_id=repo_id,
+                  repo_type="space",
+                  operations=[
+                      CommitOperationAdd(
+                          path_in_repo="README.md",
+                          path_or_fileobj=BytesIO(desired),
+                      )
+                  ],
+                  commit_message=f"Sync organization card from GitHub {os.environ['GITHUB_SHA']}",
+              )
+              print(commit.commit_url)
+          PY
